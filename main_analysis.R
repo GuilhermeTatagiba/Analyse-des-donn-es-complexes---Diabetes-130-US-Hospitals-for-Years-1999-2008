@@ -1,5 +1,5 @@
 # Project: Diabetes Hospital Dataset Analysis
-# Authors: Yuetong Lu & Guilherme Peres Tatagiba
+# Authors: Rim El Fatihi & Yuetong Lu & Guilherme Peres Tatagiba
 
 rm(list=ls())
 setwd("C:/Users/guipe/Modelisation statistique/Analyse-des-donn-es-complexes---Diabetes-130-US-Hospitals-for-Years-1999-2008")
