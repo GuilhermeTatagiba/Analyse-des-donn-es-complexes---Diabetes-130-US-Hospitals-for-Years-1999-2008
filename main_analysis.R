@@ -2,8 +2,8 @@
 # Authors: Rim El Fatihi & Yuetong Lu & Guilherme Peres Tatagiba
 
 rm(list=ls())
-setwd("C:/Users/guipe/Modelisation statistique/Analyse-des-donn-es-complexes---Diabetes-130-US-Hospitals-for-Years-1999-2008")
-getwd()
+#setwd("C:/Users/guipe/Modelisation statistique/Analyse-des-donn-es-complexes---Diabetes-130-US-Hospitals-for-Years-1999-2008")
+#getwd()
 
 # Chargement des bibliothèques
 library(dplyr)
@@ -100,7 +100,14 @@ gc()
 
 # 5) IMPUTATION 1 : kNN optimisé (variable-par-variable)
 cat("\n== IMPUTATION kNN (variable par variable, imp_var=FALSE) ==\n")
+
 diab_knn <- diabetes
+
+#Suppression : 
+
+diab_knn$diag_1 <- NULL
+diab_knn$diag_2 <- NULL
+diab_knn$diag_3 <- NULL
 
 # Choisir variables numériques robustes pour distance
 numeric_candidates <- intersect(names(diab_knn)[sapply(diab_knn, is.numeric)],
@@ -151,7 +158,7 @@ gc()
 #############################################
 
 # Copier le dataset kNN
-diab_em <- diab_knn
+diab_em <- diabetes
 
 # 🚨 Supprimer les anciennes variables diag_* (trop de catégories)
 diab_em$diag_1 <- NULL
@@ -174,7 +181,7 @@ for (v in names(diab_em)) {
     if (is.numeric(diab_em[[v]])) {
       methods_em[v] <- "norm"
     } else {
-      methods_em[v] <- "polyreg"
+      methods_em[v] <- "cart"
     }
   } else {
     methods_em[v] <- ""
@@ -197,7 +204,7 @@ diab_em_final <- complete(imp_em)
 # 7) IMPUTATION 3 : Random Forest (mice, method = "rf")
 #############################################
 
-diab_rf <- diab_knn
+diab_rf <- diabetes
 
 # 🚨 Supprimer diag_1/2/3 (trop de catégories)
 diab_rf$diag_1 <- NULL
