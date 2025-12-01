@@ -13,6 +13,9 @@ library(mice)        # mice (EM)
 library(forecast)    # Forecasting
 library(caret)       # Préprocessing
 
+# PARTIE 1 (TRAITEMENT DES VALEURS MANQUANTES)
+#------------------------------------------------------------------------------------
+
 # 1) Chargement des données
 diabetes <- read.csv("dataset/diabetic_data.csv", na.strings = c("", "NA", "?"))
 cat("Dimensions initiales :", dim(diabetes), "\n")
@@ -309,5 +312,147 @@ write.csv(diab_rf_final, "diabetes_missforest_sample_imputed.csv", row.names = F
 
 cat("\n== Imputation terminée: fichiers écrits ==\n")
 cat("Résumé NA finaux (kNN / EM):", sum(is.na(diab_knn_final)), "/", sum(is.na(diab_em_final)), "\n")
+
+
+#------------------------------------------------------------------------------------
+# PARTIE 2 (Sélection de variables et Régularisation)
+#------------------------------------------------------------------------------------
+
+library(glmnet)
+library(MASS)
+library(FactoMineR)
+library(factoextra)
+library(mixOmics)
+library(leaps)
+library(pROC)
+library(pls)
+
+
+# 1) Charger les données imputées
+diab_knn <- read.csv("diabetes_imputed_knn_final.csv")
+diab_em <- read.csv("diabetes_imputed_em_final.csv")
+diab_rf <- read.csv("diabetes_missforest_sample_imputed.csv")
+
+# 2) Variables à supprimer parce qu'elles donnent pas des informations pertinentes
+cols_to_remove <- c("encounter_id", "patient_nbr", "examide", "citoglipton")
+
+diab_knn <- diab_knn[, !names(diab_knn) %in% cols_to_remove]
+
+diab_em <- diab_em[, !names(diab_em) %in% cols_to_remove]
+
+diab_rf <- diab_rf[, !names(diab_rf) %in% cols_to_remove]
+
+
+diab_knn$readmit_binary <- ifelse(diab_knn$readmitted == "<30", 1, 0)
+diab_knn$readmitted <- NULL
+
+diab_em$readmit_binary <- ifelse(diab_em$readmitted == "<30", 1, 0)
+diab_em$readmitted <- NULL
+
+diab_rf$readmit_binary <- ifelse(diab_rf$readmitted == "<30", 1, 0)
+diab_rf$readmitted <- NULL
+
+
+# FONCTION POUR TESTS UNIVARIÉS + BENJAMINI-HOCHBERG
+# -----------------------------------------------------
+# Cette fonction effectue des tests univariés sur toutes les variables
+# et applique la correction de Benjamini-Hochberg pour contrôler le FDR
+
+tests_BH <- function(df, nom_methode, taille_max = 10000) {
+  cat("\n", rep("-", 50), sep = "")
+  cat("\nTests pour la méthode:", nom_methode, "\n")
+  cat(rep("-", 50), "\n", sep = "")
+  
+  # Échantillonner si le dataset est trop grand
+  if (nrow(df) > taille_max) {
+    set.seed(123)
+    df <- df[sample(1:nrow(df), taille_max), ]
+    cat("Échantillon de", taille_max, "observations utilisé\n")
+  }
+  
+  # Préparer les vecteurs pour les résultats
+  variables <- character()
+  p_values <- numeric()
+  tests_utilises <- character()
+  
+  # Variable cible
+  y <- df$readmit_binary
+  df <- df[, !colnames(df) %in% "readmit_binary"]
+  
+  # Boucle sur chaque variable
+  for (nom_var in colnames(df)) {
+    x <- df[[nom_var]]
+    
+    # Vérifier s'il y a des valeurs manquantes
+    if (any(is.na(x))) {
+      next  # Passer à la variable suivante
+    }
+    
+    # Choix du test en fonction du type de variable
+    if (is.numeric(x)) {
+      # Test de Wilcoxon pour variables numériques
+      test_result <- wilcox.test(x ~ y, exact = FALSE)
+      p_val <- test_result$p.value
+      test_type <- "Wilcoxon"
+    } else {
+      # Test du chi2 pour variables catégorielles
+      tbl <- table(x, y)
+      if (nrow(tbl) > 1 && ncol(tbl) > 1) {
+        test_result <- chisq.test(tbl)
+        p_val <- test_result$p.value
+        test_type <- "Chi2"
+      } else {
+        next  # Table trop petite
+      }
+    }
+    
+    # Stocker les résultats
+    variables <- c(variables, nom_var)
+    p_values <- c(p_values, p_val)
+    tests_utilises <- c(tests_utilises, test_type)
+  }
+  
+  # Appliquer la correction de Benjamini-Hochberg
+  p_ajustees <- p.adjust(p_values, method = "BH")
+  
+  # Créer le dataframe des résultats
+  results <- data.frame(
+    Variable = variables,
+    Test = tests_utilises,
+    P_value = p_values,
+    P_ajustee = p_ajustees,
+    Significatif = p_ajustees < 0.05
+  )
+  
+  # Trier par p-value
+  results <- results[order(results$P_value), ]
+  
+  # Statistiques
+  cat("Nombre de variables testées:", nrow(results), "\n")
+  cat("Variables significatives (p < 0.05 après correction):", 
+      sum(results$Significatif), "\n")
+  
+  # Afficher les 10 variables les plus significatives
+  cat("\nTop 10 des variables les plus significatives:\n")
+  print(head(results, 10))
+  
+  return(results)
+}
+
+# 4. APPLIQUER LES TESTS AUX 3 MÉTHODES
+# -------------------------------------
+cat("\n", rep("=", 60), sep = "")
+cat("\nDÉBUT DES TESTS MULTIPLES AVEC CORRECTION FDR\n")
+cat(rep("=", 60), "\n", sep = "")
+
+# Effectuer les tests pour chaque méthode
+resultats_knn <- tests_BH(diab_knn, "kNN Imputation")
+resultats_em <- tests_BH(diab_em, "EM Imputation")
+resultats_rf <- tests_BH(diab_rf, "RF Imputation")
+
+
+
+
+
 
 
