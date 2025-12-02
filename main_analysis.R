@@ -206,7 +206,7 @@ diab_em_final <- complete(imp_em)
 
 diab_rf <- diabetes
 
-# 🚨 Supprimer diag_1/2/3 (trop de catégories)
+# Supprimer diag_1/2/3 (trop de catégories)
 diab_rf$diag_1 <- NULL
 diab_rf$diag_2 <- NULL
 diab_rf$diag_3 <- NULL
