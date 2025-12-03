@@ -463,3 +463,145 @@ resultats_rf <- tests_BH(diab_rf, "RF Imputation")
 
 
 
+
+
+
+
+# ------------------------------------------------------------------------------------
+# PART 3: DIMENSION REDUCTION (PCA & PLS-DA) - PDF OUTPUT VERSION
+# ------------------------------------------------------------------------------------
+
+# Clean up graphics environment
+graphics.off() 
+
+
+# Load Data
+# Ensure these files exist in your working directory
+diab_knn <- readRDS("diabetes_imputed_knn_final.rds")
+
+
+diab <- diab_knn
+print(paste("Dimensions:", nrow(diab), "x", ncol(diab)))
+
+# 3. Preprocessing
+cols_to_remove <- c("encounter_id", "patient_nbr", "examide", "citoglipton")
+diab <- diab[, !names(diab) %in% cols_to_remove]
+
+# Fix Target Variable
+if("readmitted" %in% names(diab)) {
+  diab$readmit_binary <- factor(ifelse(diab$readmitted == "<30", "Readmis", "Non_readmis"))
+  diab$readmitted <- NULL
+}
+
+# Identify Variables
+vars_num <- names(diab)[sapply(diab, is.numeric)]
+vars_cat <- names(diab)[sapply(diab, is.factor) & names(diab) != "readmit_binary"]
+
+print(paste("Numeric Variables:", length(vars_num)))
+print(paste("Categorical Variables:", length(vars_cat)))
+
+# Sampling
+set.seed(123)
+n_sample <- min(15000, nrow(diab))
+diab_sample <- diab[sample(1:nrow(diab), n_sample), ]
+
+# Prepare X (Numeric only) and Y
+# Note: Using only numeric variables ignores categorical info (Race, Gender, etc.)
+# If you want to include them, you must use model.matrix (One-Hot Encoding) as discussed previously.
+X_num <- diab_sample[, vars_num]
+y <- diab_sample$readmit_binary
+
+# Remove columns with 0 variance
+var_check <- apply(X_num, 2, var, na.rm = TRUE)
+X_num <- X_num[, var_check > 0]
+
+pdf("plots/Analysis_Results_Part3.pdf", width = 10, height = 7)
+print("Generating PDF... Please wait.")
+
+# PCA
+acp_result <- PCA(X_num, scale.unit = TRUE, ncp = 10, graph = FALSE)
+
+# Scree Plot
+print(fviz_eig(acp_result, addlabels = TRUE, ylim = c(0, 50), main = "PCA - Scree Plot"))
+
+# Variable Plot
+print(fviz_pca_var(acp_result, 
+                   col.var = "contrib",
+                   gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                   repel = TRUE,
+                   select.var = list(contrib = 15),
+                   labelsize = 4,
+                   title = "PCA - Variable Contribution"))
+
+# Individual Plot
+print(fviz_pca_ind(acp_result, 
+                   geom.ind = "point", 
+                   col.ind = y,
+                   palette = c("#00AFBB", "#FC4E07"),
+                   addEllipses = TRUE,
+                   title = "PCA - Individuals"))
+
+# Contribution Plots
+print(fviz_contrib(acp_result, choice = "var", axes = 1, top = 20, title = "Contribution to PC1"))
+print(fviz_contrib(acp_result, choice = "var", axes = 2, top = 20, title = "Contribution to PC2"))
+
+
+# sPCA
+# Note: keepX must be <= number of columns in X_num.
+# Since X_num only has numeric variables (approx 7-8 variables), keepX cannot be 10.
+actual_vars <- ncol(X_num)
+keepX_val <- min(5, actual_vars) # Safe value
+
+spca_result <- spca(X_num, ncomp = 5, keepX = rep(keepX_val, 5), scale = TRUE)
+plotVar(spca_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "sPCA - Variables")
+
+
+# --- 3. PLS (mixOmics) ---
+y_numeric <- as.numeric(y) - 1
+pls_result <- pls(X_num, y_numeric, ncomp = 5, scale = TRUE)
+plotVar(pls_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "PLS - Variables")
+
+
+# sPLS
+spls_result <- spls(X_num, y_numeric, ncomp = 5, keepX = rep(keepX_val, 5), scale = TRUE)
+plotVar(spls_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "sPLS - Variables")
+
+
+# PLS-DA 
+plsda_result <- plsda(X_num, y, ncomp = 5, scale = TRUE)
+
+plotIndiv(plsda_result, comp = c(1, 2), group = y, 
+          ind.names = FALSE, ellipse = TRUE, legend = TRUE, title = "PLS-DA - Individuals")
+
+plotVar(plsda_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "PLS-DA - Variables")
+
+plotLoadings(plsda_result, comp = 1, method = 'mean', 
+             contrib = 'max', ndisplay = 20, title = "PLS-DA - Loadings PC1")
+
+# Close the PDF device
+dev.off()
+print("Plots saved to 'Analysis_Results_Part3.pdf'")
+
+
+# Top variables PCA
+var_coord <- acp_result$var$coord[, 1:2]
+var_contrib <- acp_result$var$contrib[, 1:2]
+contrib_total <- rowSums(var_contrib)
+top_vars <- head(order(contrib_total, decreasing = TRUE), 20)
+
+print("=== TOP 20 VARIABLES (PCA) ===")
+print(data.frame(
+  Variable = rownames(var_coord)[top_vars],
+  PC1_contrib = round(var_contrib[top_vars, 1], 2),
+  PC2_contrib = round(var_contrib[top_vars, 2], 2),
+  Total = round(contrib_total[top_vars], 2)
+))
+
+# Recap Table
+recap <- data.frame(
+  Methode = c("ACP", "sPCA", "PLS", "sPLS", "PLS-DA"),
+  Type = c("Unsupervised", "Unsupervised", "Supervised", "Supervised", "Supervised"),
+  Selection = c("No", "Yes", "No", "Yes", "No"),
+  Variance_PC1 = c(round(acp_result$eig[1, 2], 2), NA, NA, NA, NA)
+)
+print(recap)
