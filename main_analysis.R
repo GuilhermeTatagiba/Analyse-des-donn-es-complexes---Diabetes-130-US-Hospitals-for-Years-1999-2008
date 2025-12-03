@@ -209,7 +209,7 @@ diab_em_final <- complete(imp_em)
 
 diab_rf <- diabetes
 
-# 🚨 Supprimer diag_1/2/3 (trop de catégories)
+# Supprimer diag_1/2/3 (trop de catégories)
 diab_rf$diag_1 <- NULL
 diab_rf$diag_2 <- NULL
 diab_rf$diag_3 <- NULL
@@ -458,14 +458,8 @@ resultats_em <- tests_BH(diab_em, "EM Imputation")
 resultats_rf <- tests_BH(diab_rf, "RF Imputation")
 
 
-
-
-
-
-
-
-
-
+# Conclusion: Resultat prouve que la structure du dataset est stable malgré la méthode d’imputation.
+# Les trois sont paraille, on choisi un des trois apres
 
 # ------------------------------------------------------------------------------------
 # PART 3: DIMENSION REDUCTION (PCA & PLS-DA) - PDF OUTPUT VERSION
@@ -474,31 +468,67 @@ resultats_rf <- tests_BH(diab_rf, "RF Imputation")
 # Clean up graphics environment
 graphics.off() 
 
-
-# Load Data
-# Ensure these files exist in your working directory
-diab_knn <- readRDS("diabetes_imputed_knn_final.rds")
-
-
 diab <- diab_knn
-print(paste("Dimensions:", nrow(diab), "x", ncol(diab)))
+diab$readmit_binary <- factor(diab$readmit_binary, levels = c(0,1))
 
-# 3. Preprocessing
-cols_to_remove <- c("encounter_id", "patient_nbr", "examide", "citoglipton")
-diab <- diab[, !names(diab) %in% cols_to_remove]
+# Preprocessing
+drugs <- c("metformin","repaglinide","nateglinide","chlorpropamide",
+           "glimepiride","acetohexamide","glipizide","glyburide",
+           "tolbutamide","pioglitazone","rosiglitazone","acarbose",
+           "miglitol","troglitazone","tolazamide","examide", 
+           "citoglipton","insulin","glyburide-metformin","glipizide-metformin",
+           "glimepiride-pioglitazone","metformin-rosiglitazone","metformin-pioglitazone")
 
-# Fix Target Variable
-if("readmitted" %in% names(diab)) {
-  diab$readmit_binary <- factor(ifelse(diab$readmitted == "<30", "Readmis", "Non_readmis"))
-  diab$readmitted <- NULL
-}
+diabetes_sample <- diabetes[sample(nrow(diabetes), 20000), ]   # Échantillonnez 20,000 lignes pour éviter un temps d’exécution excessivement long
+
+results <- lapply(drugs, function(d) {
+  if(d %in% names(diabetes_sample)) {
+    prop <- prop.table(table(diabetes_sample[[d]]))
+    data.frame(drug=d, value=names(prop), prop=as.vector(prop))
+  }
+})
+
+do.call(rbind, results)
+
+# Tous les médicaments dont le taux d'utilisation dépassait 5 % ont été conservés 
+# car ils offraient une variabilité suffisante pour que le modèle puisse apprendre.
+
+# Keep major drugs like Insulin, Metformin, Glipizide, Glyburide.
+cols_to_remove <- c(
+  "encounter_id", "patient_nbr", # IDs
+  "weight", "payer_code", "medical_specialty", # Too many NAs / Uninformative
+  
+  # Sparse/Low-Value Drugs
+  "repaglinide", "nateglinide", "chlorpropamide",
+  "acetohexamide", "tolbutamide", "acarbose",
+  "miglitol", "troglitazone", "tolazamide", 
+  "examide", "citoglipton", # Often zero-variance
+  
+  # Combination Drugs
+  "glyburide.metformin", "glipizide.metformin", 
+  "metformin.rosiglitazone", "metformin.pioglitazone"
+)
+
+# Suppression
+diab <- diab %>% select(-one_of(cols_to_remove))
+
+# Vérification
+cat("Dimensions après suppression:", dim(diab), "\n")
+View(diab)
+
+
+sig_knn <- subset(resultats_knn, Significatif == TRUE)$Variable
+sig_knn <- intersect(sig_knn, names(diab))
+
 
 # Identify Variables
-vars_num <- names(diab)[sapply(diab, is.numeric)]
-vars_cat <- names(diab)[sapply(diab, is.factor) & names(diab) != "readmit_binary"]
+vars_num <- intersect(
+  sig_knn,
+  names(diab)[sapply(diab, is.numeric)]
+)
 
-print(paste("Numeric Variables:", length(vars_num)))
-print(paste("Categorical Variables:", length(vars_cat)))
+cat("Variables numériques significatives utilisées pour la réduction de dimension :\n")
+print(vars_num)
 
 # Sampling
 set.seed(123)
@@ -506,8 +536,6 @@ n_sample <- min(15000, nrow(diab))
 diab_sample <- diab[sample(1:nrow(diab), n_sample), ]
 
 # Prepare X (Numeric only) and Y
-# Note: Using only numeric variables ignores categorical info (Race, Gender, etc.)
-# If you want to include them, you must use model.matrix (One-Hot Encoding) as discussed previously.
 X_num <- diab_sample[, vars_num]
 y <- diab_sample$readmit_binary
 
@@ -516,13 +544,12 @@ var_check <- apply(X_num, 2, var, na.rm = TRUE)
 X_num <- X_num[, var_check > 0]
 
 pdf("plots/Analysis_Results_Part3.pdf", width = 10, height = 7)
-print("Generating PDF... Please wait.")
 
 # PCA
 acp_result <- PCA(X_num, scale.unit = TRUE, ncp = 10, graph = FALSE)
 
 # Scree Plot
-print(fviz_eig(acp_result, addlabels = TRUE, ylim = c(0, 50), main = "PCA - Scree Plot"))
+print(fviz_eig(acp_result, geom = c("bar", "line"), addlabels = TRUE, ylim = c(0, 50), main = "PCA - Scree Plot"))
 
 # Variable Plot
 print(fviz_pca_var(acp_result, 
@@ -542,21 +569,22 @@ print(fviz_pca_ind(acp_result,
                    title = "PCA - Individuals"))
 
 # Contribution Plots
-print(fviz_contrib(acp_result, choice = "var", axes = 1, top = 20, title = "Contribution to PC1"))
-print(fviz_contrib(acp_result, choice = "var", axes = 2, top = 20, title = "Contribution to PC2"))
+print(fviz_contrib(acp_result, choice = "var", axes = 1, top = 11, title = "Contribution to PC1"))
+print(fviz_contrib(acp_result, choice = "var", axes = 2, top = 11, title = "Contribution to PC2"))
+print(fviz_contrib(acp_result, choice = "var", axes = 3, top = 11, title = "Contribution to PC3"))
+print(fviz_contrib(acp_result, choice = "var", axes = 4, top = 11, title = "Contribution to PC4"))
+print(fviz_contrib(acp_result, choice = "var", axes = 5, top = 11, title = "Contribution to PC5"))
 
 
 # sPCA
-# Note: keepX must be <= number of columns in X_num.
-# Since X_num only has numeric variables (approx 7-8 variables), keepX cannot be 10.
 actual_vars <- ncol(X_num)
-keepX_val <- min(5, actual_vars) # Safe value
+keepX_val <- min(5, actual_vars) 
 
 spca_result <- spca(X_num, ncomp = 5, keepX = rep(keepX_val, 5), scale = TRUE)
 plotVar(spca_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "sPCA - Variables")
 
 
-# --- 3. PLS (mixOmics) ---
+# PLS (mixOmics)
 y_numeric <- as.numeric(y) - 1
 pls_result <- pls(X_num, y_numeric, ncomp = 5, scale = TRUE)
 plotVar(pls_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "PLS - Variables")
@@ -576,24 +604,27 @@ plotIndiv(plsda_result, comp = c(1, 2), group = y,
 plotVar(plsda_result, comp = c(1, 2), var.names = TRUE, cex = 4, title = "PLS-DA - Variables")
 
 plotLoadings(plsda_result, comp = 1, method = 'mean', 
-             contrib = 'max', ndisplay = 20, title = "PLS-DA - Loadings PC1")
+             contrib = 'max', ndisplay = 11, title = "PLS-DA - Loadings PC1")
 
 # Close the PDF device
 dev.off()
-print("Plots saved to 'Analysis_Results_Part3.pdf'")
+print("Plots saved to 'Part3_selected.pdf'")
 
 
 # Top variables PCA
-var_coord <- acp_result$var$coord[, 1:2]
-var_contrib <- acp_result$var$contrib[, 1:2]
+var_coord <- acp_result$var$coord[, 1:5]
+var_contrib <- acp_result$var$contrib[, 1:5]
 contrib_total <- rowSums(var_contrib)
-top_vars <- head(order(contrib_total, decreasing = TRUE), 20)
+top_vars <- head(order(contrib_total, decreasing = TRUE), 11)
 
-print("=== TOP 20 VARIABLES (PCA) ===")
+print("=== TOP 11 VARIABLES (PCA) ===")
 print(data.frame(
   Variable = rownames(var_coord)[top_vars],
   PC1_contrib = round(var_contrib[top_vars, 1], 2),
   PC2_contrib = round(var_contrib[top_vars, 2], 2),
+  PC3_contrib = round(var_contrib[top_vars, 3], 2),
+  PC4_contrib = round(var_contrib[top_vars, 4], 2),
+  PC5_contrib = round(var_contrib[top_vars, 5], 2),
   Total = round(contrib_total[top_vars], 2)
 ))
 
@@ -605,3 +636,25 @@ recap <- data.frame(
   Variance_PC1 = c(round(acp_result$eig[1, 2], 2), NA, NA, NA, NA)
 )
 print(recap)
+
+# ------------------------------------------------------------------------------------
+# SUMMARY TABLE (RECAP)
+# ------------------------------------------------------------------------------------
+
+# 1. Method Comparison:
+#    - ACP (PCA): A baseline unsupervised method. It shows that the first principal component (PC1)
+#      explains approximately 18.8% of the total variance, driven mainly by 'number_inpatient' and 'num_medications'.
+#    - sPCA / sPLS (Sparse Methods): These methods applied automatic variable selection (Selection = Yes).
+#      By setting coefficient weights to zero for irrelevant variables, they highlighted the most critical features
+#      (e.g., number_inpatient, time_in_hospital) and reduced noise.
+#    - PLS-DA (Supervised): This method attempted to discriminate between 'Readmis' and 'Non_readmis'
+#      using the target variable Y.
+
+# 2. Key Observations from Plots:
+#    - Feature Importance: Across all methods, 'number_inpatient' (history of admission) and 
+#      'num_medications' (treatment intensity) consistently appear as the top contributors.
+#    - Class Separation: The PLS-DA individual plots showed a heavy overlap between the two classes.
+#      This indicates that the numeric variables alone do not provide a clear linear separation boundary.
+
+# 3. Conclusion : It is crucial to include categorical variables
+
