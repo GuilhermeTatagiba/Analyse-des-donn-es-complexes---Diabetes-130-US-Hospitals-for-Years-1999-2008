@@ -163,7 +163,7 @@ gc()
 # Copier le dataset kNN
 diab_em <- diabetes
 
-# 🚨 Supprimer les anciennes variables diag_* (trop de catégories)
+#Supprimer les anciennes variables diag_* (trop de catégories)
 diab_em$diag_1 <- NULL
 diab_em$diag_2 <- NULL
 diab_em$diag_3 <- NULL
@@ -510,7 +510,8 @@ cols_to_remove <- c(
 )
 
 # Suppression
-diab <- diab %>% select(-one_of(cols_to_remove))
+diab <- dplyr::select(diab, -dplyr::any_of(cols_to_remove))
+
 
 # Vérification
 cat("Dimensions après suppression:", dim(diab), "\n")
@@ -540,7 +541,8 @@ X_num <- diab_sample[, vars_num]
 y <- diab_sample$readmit_binary
 
 # Remove columns with 0 variance
-var_check <- apply(X_num, 2, var, na.rm = TRUE)
+var_check <- apply(X_num, 2, stats::var, na.rm = TRUE)
+
 X_num <- X_num[, var_check > 0]
 
 pdf("plots/Analysis_Results_Part3.pdf", width = 10, height = 7)
@@ -608,7 +610,6 @@ plotLoadings(plsda_result, comp = 1, method = 'mean',
 
 # Close the PDF device
 dev.off()
-print("Plots saved to 'Part3_selected.pdf'")
 
 
 # Top variables PCA
@@ -658,3 +659,378 @@ print(recap)
 
 # 3. Conclusion : It is crucial to include categorical variables
 
+#------------------------------------------------------------------------------------
+# PARTIE 4 – MODÉLISATION PRÉDICTIVE
+# (Ridge, Lasso, Elastic-Net, GAM, Random Forest, XGBoost)
+#------------------------------------------------------------------------------------
+
+library(caret)
+library(glmnet)
+library(pROC)
+library(mgcv)
+library(randomForest)
+library(xgboost)
+
+set.seed(123)
+# 4.0 – Dataset de travail : imputation kNN (déjà nettoyé plus haut)
+data_model <- diab_knn
+
+# Cible binaire : Yes = readmission < 30 jours, No = sinon
+data_model$readmit_binary <- factor(
+  ifelse(data_model$readmit_binary == 1, "Yes", "No"),
+  levels = c("No", "Yes")   # "Yes" = classe positive
+)
+
+cat("\nRépartition de la cible (No / Yes) :\n")
+print(table(data_model$readmit_binary))
+
+# ================================
+# 4.1 – Split train/test (70% / 30%)
+# ================================
+set.seed(123)  # reproductible
+trainIndex <- createDataPartition(data_model$readmit_binary, p = 0.7, list = FALSE)
+
+train_df <- data_model[trainIndex, ]
+test_df  <- data_model[-trainIndex, ]
+
+# On s'assure que la cible est bien factor dans les deux
+train_df$readmit_binary <- factor(train_df$readmit_binary, levels = c("No", "Yes"))
+test_df$readmit_binary  <- factor(test_df$readmit_binary,  levels = c("No", "Yes"))
+
+# Séparation prédicteurs / cible
+pred_cols <- setdiff(names(train_df), "readmit_binary")
+
+X_train_raw <- train_df[, pred_cols, drop = FALSE]
+X_test_raw  <- test_df[,  pred_cols, drop = FALSE]
+
+y_train_fac <- train_df$readmit_binary
+y_test_fac  <- test_df$readmit_binary
+
+# ==========================================
+# 4.1 bis – Supprimer les prédicteurs constants dans le TRAIN
+# ==========================================
+is_constant <- sapply(X_train_raw, function(col) {
+  length(unique(col[!is.na(col)])) < 2
+})
+
+if (any(is_constant)) {
+  cat("\nVariables constantes supprimées du modèle :\n")
+  print(names(X_train_raw)[is_constant])
+  
+  X_train_raw <- X_train_raw[, !is_constant, drop = FALSE]
+  X_test_raw  <- X_test_raw[,  !is_constant, drop = FALSE]
+}
+
+# Harmoniser les types : convertir les character en factors
+char_cols <- sapply(X_train_raw, is.character)
+if (any(char_cols)) {
+  X_train_raw[ , char_cols] <- lapply(X_train_raw[ , char_cols, drop = FALSE], factor)
+  X_test_raw[  , char_cols] <- lapply(X_test_raw[  , char_cols, drop = FALSE], factor)
+}
+
+# Pour chaque factor, imposer les mêmes niveaux dans test que dans train
+for (nm in names(X_train_raw)) {
+  if (is.factor(X_train_raw[[nm]])) {
+    X_test_raw[[nm]] <- factor(X_test_raw[[nm]], levels = levels(X_train_raw[[nm]]))
+  }
+}
+
+# ==========================================
+# 4.2 – Encodage one-hot avec dummyVars sur TRAIN + TEST
+# ==========================================
+
+# On colle train et test prédicteurs
+full_X_raw <- rbind(X_train_raw, X_test_raw)
+n_train <- nrow(X_train_raw)
+
+# dummyVars sur l'ensemble (sans la cible)
+dmy <- dummyVars(~ ., data = full_X_raw, fullRank = TRUE)
+
+full_X <- predict(dmy, newdata = full_X_raw)
+full_X <- as.data.frame(full_X)
+
+# On recoupe
+x_train <- full_X[1:n_train, , drop = FALSE]
+x_test  <- full_X[(n_train + 1):nrow(full_X), , drop = FALSE]
+
+# Cible numérique (Yes = 1, No = 0) pour glmnet / xgboost
+y_train_num <- ifelse(y_train_fac == "Yes", 1, 0)
+y_test_num  <- ifelse(y_test_fac == "Yes", 1, 0)
+
+# Matrices pour glmnet / xgboost
+x_train_mat <- as.matrix(x_train)
+x_test_mat  <- as.matrix(x_test)
+
+cat("\nDimensions X_train / X_test :", dim(x_train_mat), "/", dim(x_test_mat), "\n")
+
+# 4.3 – Fonction utilitaire : calcul des métriques (AUC, Accuracy, Recall, F1)
+compute_metrics <- function(y_true_fac, y_true_num, prob_pred, positive_label = "Yes", threshold = 0.5) {
+  # AUC
+  roc_obj <- roc(y_true_num, prob_pred)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  # Classes prédites
+  pred_class <- factor(ifelse(prob_pred > threshold, positive_label, "No"),
+                       levels = c("No", positive_label))
+  
+  cm <- confusionMatrix(pred_class, y_true_fac, positive = positive_label)
+  
+  acc <- as.numeric(cm$overall["Accuracy"])
+  recall <- as.numeric(cm$byClass["Recall"])
+  f1 <- as.numeric(cm$byClass["F1"])
+  
+  return(list(
+    AUC = auc_val,
+    Accuracy = acc,
+    Recall = recall,
+    F1 = f1
+  ))
+}
+
+results_models <- data.frame(
+  Model = character(),
+  AUC = numeric(),
+  Accuracy = numeric(),
+  Recall = numeric(),
+  F1 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+#------------------------------------------------------------------------------------
+# 4.A – Régression logistique pénalisée (Ridge, Lasso, Elastic-Net)
+#------------------------------------------------------------------------------------
+
+# A.1 – Ridge (alpha = 0)
+cv_ridge <- cv.glmnet(
+  x_train_mat, y_train_num,
+  family = "binomial",
+  alpha = 0,             # Ridge
+  nfolds = 5,
+  type.measure = "auc"
+)
+lambda_ridge <- cv_ridge$lambda.min
+cat("\n[RIDGE] Lambda optimal :", lambda_ridge, "\n")
+
+ridge_model <- glmnet(
+  x_train_mat, y_train_num,
+  family = "binomial",
+  alpha = 0,
+  lambda = lambda_ridge
+)
+
+prob_ridge <- as.numeric(predict(ridge_model, newx = x_test_mat, type = "response"))
+met_ridge <- compute_metrics(y_test_fac, y_test_num, prob_ridge)
+
+results_models <- rbind(results_models, data.frame(
+  Model = "Ridge",
+  AUC = met_ridge$AUC,
+  Accuracy = met_ridge$Accuracy,
+  Recall = met_ridge$Recall,
+  F1 = met_ridge$F1
+))
+
+# A.2 – Lasso (alpha = 1)
+cv_lasso <- cv.glmnet(
+  x_train_mat, y_train_num,
+  family = "binomial",
+  alpha = 1,             # Lasso
+  nfolds = 5,
+  type.measure = "auc"
+)
+lambda_lasso <- cv_lasso$lambda.min
+cat("\n[LASSO] Lambda optimal :", lambda_lasso, "\n")
+
+lasso_model <- glmnet(
+  x_train_mat, y_train_num,
+  family = "binomial",
+  alpha = 1,
+  lambda = lambda_lasso
+)
+
+prob_lasso <- as.numeric(predict(lasso_model, newx = x_test_mat, type = "response"))
+met_lasso <- compute_metrics(y_test_fac, y_test_num, prob_lasso)
+
+results_models <- rbind(results_models, data.frame(
+  Model = "Lasso",
+  AUC = met_lasso$AUC,
+  Accuracy = met_lasso$Accuracy,
+  Recall = met_lasso$Recall,
+  F1 = met_lasso$F1
+))
+
+# A.3 – Elastic-Net (alpha entre 0 et 1, ex: 0.5)
+cv_en <- cv.glmnet(
+  x_train_mat, y_train_num,
+  family = "binomial",
+  alpha = 0.5,           # Elastic-Net
+  nfolds = 5,
+  type.measure = "auc"
+)
+lambda_en <- cv_en$lambda.min
+cat("\n[Elastic-Net] Lambda optimal :", lambda_en, "\n")
+
+en_model <- glmnet(
+  x_train_mat, y_train_num,
+  family = "binomial",
+  alpha = 0.5,
+  lambda = lambda_en
+)
+
+prob_en <- as.numeric(predict(en_model, newx = x_test_mat, type = "response"))
+met_en <- compute_metrics(y_test_fac, y_test_num, prob_en)
+
+results_models <- rbind(results_models, data.frame(
+  Model = "Elastic-Net",
+  AUC = met_en$AUC,
+  Accuracy = met_en$Accuracy,
+  Recall = met_en$Recall,
+  F1 = met_en$F1
+))
+
+#------------------------------------------------------------------------------------
+# 4.B – Modèle additif généralisé (GAM) – prise en compte d'effets non linéaires
+#------------------------------------------------------------------------------------
+
+library(mgcv)  # au cas où ce n'est pas déjà chargé
+# ------------------------------------------------------------------------------------
+# Sélection des variables pour le modèle GAM
+# ------------------------------------------------------------------------------------
+# Le modèle additif généralisé (GAM) permet de capturer des relations non linéaires
+# entre les prédicteurs et la probabilité de réadmission grâce aux fonctions de lissage
+# s(x1), s(x2), ..., s(xp).
+#
+# Cependant, un GAM n'est pas adapté à toutes les variables :
+#   - Les variables catégorielles à nombreux niveaux ne peuvent pas être lissées correctement.
+#   - Les variables one-hot issues de l'encodage créent des fonctions s(0/1) inutiles.
+#   - Le modèle devient instable et difficile à interpréter si trop de variables sont incluses.
+#
+# Pour cette raison, nous ne retenons PAS toutes les variables significatives des modèles
+# précédents (logistique, LASSO, Random Forest). Nous sélectionnons uniquement celles
+# qui répondent aux critères suivants :
+#
+#   1. Variables NUMÉRIQUES et CONTINUES
+#   2. Identifiées comme IMPORTANTES dans les modèles précédents
+#   3. Présentant une VARIABILITÉ suffisante (pas de colonnes constantes)
+#   4. Ayant un sens clinique clair et une relation potentiellement NON LINÉAIRE
+#
+# Les variables retenues ici (time_in_hospital, num_medications, number_inpatient,
+# number_emergency, number_diagnoses) satisfont toutes ces conditions.
+#
+# Elles permettent au GAM de modéliser des effets lissés interprétables, comme :
+#   - augmentation du risque avec le nombre de diagnostics,
+#   - effets non linéaires du temps d'hospitalisation,
+#   - relation complexe avec le nombre d’inpatient/emergency visits.
+#
+# Ce choix garantit un modèle GAM :
+#   - stable,
+#   - interprétable,
+#   - utile pour visualiser la forme des relations non linéaires,
+#   - complémentaire aux modèles supervisés classiques.
+# ------------------------------------------------------------------------------------
+
+# On choisit quelques variables numériques importantes identifiées auparavant
+vars_gam <- c("time_in_hospital", "num_medications", "number_inpatient",
+              "number_emergency", "number_diagnoses")
+
+# On croise avec les colonnes effectivement présentes dans train_df
+vars_gam <- intersect(vars_gam, colnames(train_df))
+
+cat("\nVariables utilisées dans le GAM :\n")
+print(vars_gam)
+
+if (length(vars_gam) == 0) {
+  stop("Aucune des variables spécifiées pour le GAM n'est présente dans train_df.")
+}
+
+# Formule GAM : readmit_binary ~ s(var1) + s(var2) + ...
+gam_formula <- as.formula(
+  paste("readmit_binary ~",
+        paste(paste0("s(", vars_gam, ")"), collapse = " + "))
+)
+
+cat("\nFormule GAM utilisée :\n")
+print(gam_formula)
+
+# Ajustement du modèle sur le train ORIGINAL (pas les x_train_mat)
+gam_model <- gam(gam_formula, data = train_df, family = binomial(link = "logit"))
+
+# Prédictions de probas sur le test_df (même structure que train_df)
+prob_gam <- as.numeric(predict(gam_model, newdata = test_df, type = "response"))
+
+# Évaluation (on utilise y_test_fac / y_test_num définis plus haut)
+met_gam <- compute_metrics(y_test_fac, y_test_num, prob_gam)
+
+results_models <- rbind(
+  results_models,
+  data.frame(
+    Model = "GAM",
+    AUC = met_gam$AUC,
+    Accuracy = met_gam$Accuracy,
+    Recall = met_gam$Recall,
+    F1 = met_gam$F1
+  )
+)
+
+#------------------------------------------------------------------------------------
+# 4.C – Random Forest
+#------------------------------------------------------------------------------------
+
+rf_model <- randomForest(
+  x = x_train,
+  y = y_train_fac,
+  ntree = 300,
+  mtry = floor(sqrt(ncol(x_train))),
+  importance = TRUE
+)
+
+prob_rf <- as.numeric(predict(rf_model, newdata = x_test, type = "prob")[, "Yes"])
+met_rf <- compute_metrics(y_test_fac, y_test_num, prob_rf)
+
+results_models <- rbind(results_models, data.frame(
+  Model = "Random Forest",
+  AUC = met_rf$AUC,
+  Accuracy = met_rf$Accuracy,
+  Recall = met_rf$Recall,
+  F1 = met_rf$F1
+))
+
+#------------------------------------------------------------------------------------
+# 4.D – XGBoost
+#------------------------------------------------------------------------------------
+
+dtrain <- xgb.DMatrix(data = x_train_mat, label = y_train_num)
+dtest  <- xgb.DMatrix(data = x_test_mat,  label = y_test_num)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 4,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+prob_xgb <- as.numeric(predict(xgb_model, newdata = dtest))
+met_xgb <- compute_metrics(y_test_fac, y_test_num, prob_xgb)
+
+results_models <- rbind(results_models, data.frame(
+  Model = "XGBoost",
+  AUC = met_xgb$AUC,
+  Accuracy = met_xgb$Accuracy,
+  Recall = met_xgb$Recall,
+  F1 = met_xgb$F1
+))
+
+#------------------------------------------------------------------------------------
+# 4.E – Récapitulatif des performances
+#------------------------------------------------------------------------------------
+
+cat("\n=== RÉCAPITULATIF DES MODÈLES (AUC, Accuracy, Recall, F1) ===\n")
+print(results_models)
